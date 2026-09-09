@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# KryptDisk runtime state
+nodes/
+runtime/
+logs/
+data/
+updates/
+backups/
+key_events.log
+
+# Node identity / keys / profiles
+profile.json
+**/profile.json
+keys/
+**/keys/
+*.pem
+*.key
+
+# Peer/runtime discovery state
+peer_digest.json
+**/peer_digest.json
+launcher.lock
+launcher.json
+node_ready.json
+restart_pending.json
+
+# Messages, retrieved payloads and local stores
+inbox/
+retrieved/
+chunked/
+airgap/
+vault_store/
+*.msg
+
+# Local patches / update capsules
+*.kdkpatch
+
+# Backups and scratch copies
+*.bak
+*.bak_*
+*.pre-*
+*.before-*
+kdk_core_10.20.*.py
+python_patch.py
+menu_demo.py
+
+# Local/test configuration variants
+mesh_config.local.json
+mesh_config.private.json
+
+# Logs and diagnostics
+*.log
+*.csv
+
+# Editor / OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Packaging/build output
+build/
+dist/
+*.spec

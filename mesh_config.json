@@ -1,0 +1,14 @@
+{
+  "nodes": {},
+  "bootstrap_peers": [
+    "49.13.141.184:6001"
+  ],
+  "pow_bits": 12,
+  "collision_trigger_n": 50,
+  "fan_choices": [
+    1
+  ],
+  "update_policy": "stage",
+  "auto_apply_update": false,
+  "auto_restart_update": false
+}
