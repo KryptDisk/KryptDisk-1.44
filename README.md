@@ -39,8 +39,10 @@ To start an already configured node manually:
 
 ## Windows
 
-A packaged Windows beta is provided through GitHub Releases. The source tree
-can also be run directly with a suitable Python environment.
+A packaged Windows 11 beta is provided through GitHub Releases. The installer
+preserves an existing KryptDisk configuration during upgrades and will shut
+down a running KryptDisk node before replacing application files. The source
+tree can also be run directly with a suitable Python environment.
 
 ## Network configuration
 
