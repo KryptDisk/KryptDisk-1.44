@@ -12,18 +12,98 @@ import signal
 import subprocess
 import shlex
 import sys
+import threading
 import time
 import re
 import unicodedata
 from typing import Dict, List, Optional, TextIO
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "mesh_config.json"
 CORE_PATH = ROOT / "kdk_core.py"
 RESTART_EXIT_CODES = {42, 43}
 STARTUP_TIMEOUT_SECS = 20.0
 STOP_TIMEOUT_SECS = 5.0
+SPLASH_PATH = ROOT / "KryptDisk-splash.png"
+_SPLASH_ROOT = None
+_SPLASH_STARTED = 0.0
 
+
+def _is_packaged_windows_parent() -> bool:
+    if os.name != "nt" or not bool(getattr(sys, "frozen", False)):
+        return False
+    return "--kdk-node-child" not in [str(x).strip().lower() for x in sys.argv[1:]]
+
+
+def _maximize_windows_console() -> None:
+    """Windows Terminal is maximised by the launcher shortcut, not Console HWND."""
+    return
+
+def _show_startup_splash() -> None:
+    """Show the packaged Windows splash while the supervised node becomes ready."""
+    global _SPLASH_ROOT, _SPLASH_STARTED
+    if not _is_packaged_windows_parent() or not SPLASH_PATH.is_file():
+        return
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        root.overrideredirect(True)
+        root.attributes("-topmost", True)
+        image = tk.PhotoImage(file=str(SPLASH_PATH))
+        label = tk.Label(root, image=image, borderwidth=0, highlightthickness=0)
+        label.image = image
+        label.pack()
+        root.update_idletasks()
+        width, height = image.width(), image.height()
+        x = max(0, (root.winfo_screenwidth() - width) // 2)
+        y = max(0, (root.winfo_screenheight() - height) // 2)
+        root.geometry(f"{width}x{height}+{x}+{y}")
+        root.deiconify()
+        root.update()
+        _SPLASH_ROOT = root
+        _SPLASH_STARTED = time.monotonic()
+    except Exception:
+        _SPLASH_ROOT = None
+
+
+def _pump_startup_splash() -> None:
+    root = _SPLASH_ROOT
+    if root is None:
+        return
+    try:
+        root.update_idletasks()
+        root.update()
+    except Exception:
+        _close_startup_splash()
+
+
+def _close_startup_splash(*, minimum_visible_secs: float = 0.8) -> None:
+    global _SPLASH_ROOT
+    root = _SPLASH_ROOT
+    _SPLASH_ROOT = None
+    if root is None:
+        return
+    try:
+        elapsed = time.monotonic() - _SPLASH_STARTED
+        if elapsed < minimum_visible_secs:
+            deadline = time.monotonic() + (minimum_visible_secs - elapsed)
+            while time.monotonic() < deadline:
+                try:
+                    root.update_idletasks()
+                    root.update()
+                except Exception:
+                    break
+                time.sleep(0.02)
+        try:
+            root.attributes("-topmost", False)
+        except Exception:
+            pass
+        root.withdraw()
+        root.update_idletasks()
+        root.destroy()
+    except Exception:
+        pass
 
 def _status(message: str) -> None:
     """Emit one stable preflight/status line for consoles and future splash adapters."""
@@ -117,23 +197,25 @@ def _resolve_python_runtime() -> str:
     """Resolve the interpreter used for the updateable kdk_core.py child."""
     if not bool(getattr(sys, "frozen", False)):
         return os.path.abspath(sys.executable)
+    # The frozen executable already contains Python and the core dependencies.
+    # It re-enters itself with --kdk-node-child and loads the external core.
+    return os.path.abspath(sys.executable)
 
-    candidates = []
-    configured = str(os.environ.get("KDK_PYTHON", "") or "").strip()
-    if configured:
-        candidates.append(Path(configured))
-    candidates.extend([
-        ROOT / "runtime" / "python.exe",
-        ROOT / "python" / "python.exe",
-        ROOT / "python.exe",
-    ])
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate.resolve())
-    raise SystemExit(
-        "[LAUNCHER] packaged launcher cannot find its private Python runtime; "
-        "expected runtime\\python.exe (or set KDK_PYTHON)"
-    )
+
+def _run_frozen_core_child(raw: List[str]) -> int:
+    """Load the external, patchable core inside the packaged child process."""
+    if not bool(getattr(sys, "frozen", False)):
+        raise SystemExit("[LAUNCHER] --kdk-node-child is reserved for packaged builds")
+    if not CORE_PATH.is_file():
+        raise SystemExit(f"[LAUNCHER] core missing: {CORE_PATH}")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("kdk_core", CORE_PATH)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"[LAUNCHER] cannot load core: {CORE_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["kdk_core"] = module
+    spec.loader.exec_module(module)
+    return int(module.main(list(raw)) or 0)
 
 
 def _atomic_json(path: Path, data: dict) -> None:
@@ -346,8 +428,9 @@ def _is_node_command(cmd: str, node: str, port: int, *,
     name_ok = _has_option(parts, "--name", node)
     if display_name:
         name_ok = name_ok or _has_option(parts, "--name", display_name)
+    packaged_child = "--kdk-node-child" in [str(x).strip().lower() for x in parts]
     return (
-        (core in low or "/kdk_core.py" in low)
+        (core in low or "/kdk_core.py" in low or packaged_child)
         and _has_option(parts, "--port", str(int(port)))
         and (profile_ok or name_ok)
     )
@@ -359,9 +442,14 @@ def _is_launcher_command(cmd: str, node: str) -> bool:
     launcher_named = (
         "/launch_node.py" in low
         or "kryptdisk launcher.exe" in low
+        or "kryptdisk 1.44.exe" in low
         or "/kryptdisk-launcher" in low
     )
-    return launcher_named and any(str(x).strip().strip('"').lower() == node.lower() for x in parts)
+    named = any(str(x).strip().strip('"').lower() == node.lower() for x in parts)
+    packaged_default = "kryptdisk 1.44.exe" in low and not any(
+        str(x).strip().startswith("--") for x in parts[1:]
+    )
+    return launcher_named and (named or packaged_default)
 
 
 def _process_has_interactive_tty(pid: int) -> bool:
@@ -555,9 +643,91 @@ def _restore_backup(marker: dict, backup_root: Path) -> bool:
         return False
 
 
+_WINDOWS_CLOSE_REQUESTED = threading.Event()
+_WINDOWS_CTRL_HANDLER = None
+
+
+def _install_windows_close_handler() -> None:
+    """Convert a Windows console-close request into orderly launcher shutdown."""
+    global _WINDOWS_CTRL_HANDLER
+
+    if os.name != "nt":
+        return
+
+    try:
+        import ctypes
+
+        handler_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+
+        def _handler(ctrl_type):
+            # CTRL_C_EVENT=0, CTRL_BREAK_EVENT=1, CTRL_CLOSE_EVENT=2,
+            # CTRL_LOGOFF_EVENT=5, CTRL_SHUTDOWN_EVENT=6.
+            if ctrl_type in (0, 1, 2, 5, 6):
+                _WINDOWS_CLOSE_REQUESTED.set()
+                return True
+            return False
+
+        _WINDOWS_CTRL_HANDLER = handler_type(_handler)
+        if not ctypes.windll.kernel32.SetConsoleCtrlHandler(
+            _WINDOWS_CTRL_HANDLER, True
+        ):
+            raise OSError("SetConsoleCtrlHandler failed")
+    except Exception as exc:
+        print(f"[LAUNCHER] Windows close-handler warning: {exc}", flush=True)
+
+def _shutdown_for_upgrade() -> int:
+    """Stop verified KryptDisk launcher trees before an installer upgrade."""
+    nodes_root = ROOT / "nodes"
+    if not nodes_root.exists():
+        print("[LAUNCHER] no nodes directory; nothing to stop", flush=True)
+        return 0
+
+    found = False
+    failed = False
+
+    for launcher_path in nodes_root.glob("*/runtime/launcher.json"):
+        node = launcher_path.parent.parent.name
+        pid = _verified_launcher_pid(node, launcher_path)
+
+        if not pid:
+            continue
+
+        found = True
+        print(
+            f"[LAUNCHER] upgrade shutdown: stopping {node} launcher pid={pid}",
+            flush=True,
+        )
+
+        if not _terminate_verified(pid):
+            print(
+                f"[LAUNCHER] upgrade shutdown FAILED: {node} launcher pid={pid}",
+                flush=True,
+            )
+            failed = True
+        else:
+            print(
+                f"[LAUNCHER] upgrade shutdown complete: {node} pid={pid}",
+                flush=True,
+            )
+
+    if not found:
+        print("[LAUNCHER] no verified running launchers found", flush=True)
+
+    return 1 if failed else 0
+
 def main() -> None:
+    raw_args = list(sys.argv[1:])
+
+    if raw_args == ["--shutdown-for-upgrade"]:
+        raise SystemExit(_shutdown_for_upgrade())
+
+    if raw_args[:1] == ["--kdk-node-child"]:
+        raise SystemExit(_run_frozen_core_child(raw_args[1:]))
+
+    _maximize_windows_console()
+
     parser = argparse.ArgumentParser(description="Launch a supervised KryptDisk mesh node")
-    parser.add_argument("node", help="Node name from mesh_config.json, e.g. Kryptonaut")
+    parser.add_argument("node", nargs="?", help="Stable profile name from mesh_config.json")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--debug-wire", action="store_true")
     args = parser.parse_args()
@@ -571,8 +741,16 @@ def main() -> None:
     nodes = cfg.get("nodes", {})
     if not isinstance(nodes, dict) or not nodes:
         raise SystemExit(f"[LAUNCHER] configuration has no usable 'nodes' object: {CONFIG_PATH}")
-    if args.node not in nodes:
-        raise SystemExit(f"Unknown node {args.node!r}. Available: {', '.join(nodes)}")
+    profile_key = str(args.node or cfg.get("default_node", "") or "").strip()
+    if not profile_key and len(nodes) == 1:
+        profile_key = str(next(iter(nodes)))
+    if not profile_key:
+        raise SystemExit(
+            f"[LAUNCHER] more than one profile is configured; choose one: {', '.join(nodes)}"
+        )
+    if profile_key not in nodes:
+        raise SystemExit(f"Unknown node {profile_key!r}. Available: {', '.join(nodes)}")
+    args.node = profile_key
 
     node_cfg = nodes[args.node]
     if not isinstance(node_cfg, dict):
@@ -702,7 +880,10 @@ def main() -> None:
     python_runtime = _resolve_python_runtime()
     # launch_node.py is the sole supervisor. Bypass kdk_core.py's own
     # compatibility supervisor and start the actual node process directly.
-    command = [python_runtime, str(CORE_PATH), "--kdk-node-child", *argv]
+    if bool(getattr(sys, "frozen", False)):
+        command = [python_runtime, "--kdk-node-child", *argv]
+    else:
+        command = [python_runtime, str(CORE_PATH), "--kdk-node-child", *argv]
 
     try:
         while True:
@@ -725,6 +906,7 @@ def main() -> None:
             confirmed = False
             last_ready = {}
             while time.time() < deadline:
+                _pump_startup_splash()
                 if child.poll() is not None:
                     break
                 ready = _read_json(ready_path)
@@ -747,10 +929,13 @@ def main() -> None:
                     and int(ready.get("port", 0) or 0) == port
                 ):
                     confirmed = True
+                    _close_startup_splash()
+                    _maximize_windows_console()
                     break
                 time.sleep(0.20)
 
             if not confirmed:
+                _close_startup_splash()
                 diag_ready = last_ready or _read_json(ready_path)
                 diag = _ready_diagnostics(
                     diag_ready,
@@ -829,12 +1014,29 @@ def main() -> None:
                 f"port={port} mode={ownership_mode} "
                 f"ppid_verified={bool(ready.get('ppid_verified', False))}"
             )
+            _install_windows_close_handler()
             try:
-                rc = int(child.wait())
+                while True:
+                    try:
+                        rc = int(child.wait(timeout=0.25))
+                        break
+                    except subprocess.TimeoutExpired:
+                        if _WINDOWS_CLOSE_REQUESTED.is_set():
+                            print(
+                                "[LAUNCHER] Windows close requested; stopping child",
+                                flush=True,
+                            )
+                            _terminate_verified(child.pid)
+                            rc = int(child.wait())
+                            break
             except KeyboardInterrupt:
                 print("\n[LAUNCHER] interrupted; stopping child")
                 _terminate_verified(child.pid)
                 raise SystemExit(130)
+
+            if _WINDOWS_CLOSE_REQUESTED.is_set():
+                print("[LAUNCHER] Windows shutdown complete", flush=True)
+                raise SystemExit(0)
 
             if rc in RESTART_EXIT_CODES:
                 why = "update" if rc == 42 else "manual"
@@ -842,6 +1044,7 @@ def main() -> None:
                 continue
             raise SystemExit(rc)
     finally:
+        _close_startup_splash(minimum_visible_secs=0.0)
         try:
             if int(_read_json(launcher_path).get("pid", 0) or 0) == os.getpid():
                 launcher_path.unlink()
