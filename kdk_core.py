@@ -425,9 +425,9 @@ DIRECTORY_HINT_MAX = 16
 # Queue emission pacing. A queued real envelope (message, chunk, receipt, RPC)
 # is released only on a collision-earned turn. After any queued envelope is
 # emitted, the node waits a random number of future turns before releasing
-# another queued envelope; those intervening turns emit dummy cover traffic.
+# another queued envelope; those intervening turns emit dummy traffic.
 # Keep the default gap tight but use probabilistic weighted
-# selection so real work progresses while dummy cover remains interleaved.
+# selection so real work progresses while dummy traffic remains interleaved.
 QUEUE_EMIT_GAP_MIN_TURNS = 1
 QUEUE_EMIT_GAP_MAX_TURNS = 3
 QUEUE_DUMMY_BLEND_NORMAL = 0.35
@@ -514,10 +514,14 @@ def compute_script_hash() -> str:
     except Exception:
         return "unknown"
 
-SCRIPT_VERSION = "10.20.95-collision-rate-continuity-KryptDisk-1.44-Beta-1"
-# Monotonic build order used for update decisions.  The descriptive version
-# remains human-readable; SCRIPT_REVISION is the machine ordering authority.
-SCRIPT_REVISION = 102095
+SCRIPT_VERSION = "10.20.96-KryptDisk-1.44-Beta-1"
+# Release identity is deliberately separate from monotonic revision ordering.
+# Nodes may follow an alternative lineage by local choice, but automatic update
+# offers never cross an explicitly different origin/lineage boundary.
+SCRIPT_ORIGIN = "KryptDisk-official"
+SCRIPT_LINEAGE = "stable"
+# Monotonic build order used for update decisions within a release lineage.
+SCRIPT_REVISION = 102096
 SCRIPT_HASH = compute_script_hash()
 
 def revision_from_version(v: str) -> int:
@@ -565,6 +569,28 @@ def extract_script_version_from_bytes(data: bytes) -> str:
     except Exception:
         pass
     return "0.0"
+
+def extract_script_release_identity_from_bytes(data: bytes) -> Tuple[str, str]:
+    """Return (origin, lineage) embedded in a core, with legacy-compatible defaults."""
+    try:
+        text = data[:65536].decode("utf-8", "ignore")
+        mo = re.search(r'^SCRIPT_ORIGIN\s*=\s*["\']([^"\']+)["\']', text, re.M)
+        ml = re.search(r'^SCRIPT_LINEAGE\s*=\s*["\']([^"\']+)["\']', text, re.M)
+        origin = mo.group(1) if mo else SCRIPT_ORIGIN
+        lineage = ml.group(1) if ml else SCRIPT_LINEAGE
+        return str(origin), str(lineage)
+    except Exception:
+        return SCRIPT_ORIGIN, SCRIPT_LINEAGE
+
+def kdk_release_identity_matches(origin: str = "", lineage: str = "") -> bool:
+    """Legacy peers with no identity remain compatible; explicit forks do not auto-cross."""
+    origin = str(origin or "").strip()
+    lineage = str(lineage or "").strip()
+    if origin and origin != SCRIPT_ORIGIN:
+        return False
+    if lineage and lineage != SCRIPT_LINEAGE:
+        return False
+    return True
 
 def unique_destination(directory: str, filename: str) -> str:
     """Return a collision-safe path without overwriting an existing file."""
@@ -723,10 +749,14 @@ def kdk_make_text_span_capsule(base_raw: bytes, target_raw: bytes, note: str = "
             "start": int(start),
         })
 
+    base_origin, base_lineage = extract_script_release_identity_from_bytes(base_raw)
+    target_origin, target_lineage = extract_script_release_identity_from_bytes(target_raw)
     bundle = {
         "base_hash": sha256(base_raw),
         "base_version": extract_script_version_from_bytes(base_raw),
         "base_revision": extract_script_revision_from_bytes(base_raw),
+        "base_origin": base_origin,
+        "base_lineage": base_lineage,
         "kind": KDK_UPDATE_KIND,
         "note": str(note or "KDK external patch capsule: exact base -> exact target"),
         "ops": ops,
@@ -734,6 +764,8 @@ def kdk_make_text_span_capsule(base_raw: bytes, target_raw: bytes, note: str = "
         "target_hash": sha256(target_raw),
         "target_version": extract_script_version_from_bytes(target_raw),
         "target_revision": extract_script_revision_from_bytes(target_raw),
+        "target_origin": target_origin,
+        "target_lineage": target_lineage,
         "transport": "mesh-chunks",
         "ver": 2,
     }
@@ -1003,6 +1035,8 @@ def kdk_write_supervisor_ready(node) -> bool:
             "port": int(getattr(node, "port", 0)),
             "version": SCRIPT_VERSION,
             "revision": int(SCRIPT_REVISION),
+            "origin": SCRIPT_ORIGIN,
+            "lineage": SCRIPT_LINEAGE,
             "hash": hashlib.sha256(open(os.path.abspath(__file__), "rb").read()).hexdigest(),
             "ready_ts": int(time.time()),
         }
@@ -1254,6 +1288,20 @@ def centre_console_window() -> bool:
         return False
 
 
+def windows_keep_awake(enable: bool) -> bool:
+    """Opt in/out of Windows system-sleep suppression for this process lifetime."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        es_continuous = 0x80000000
+        es_system_required = 0x00000001
+        flags = es_continuous | es_system_required if bool(enable) else es_continuous
+        return bool(ctypes.windll.kernel32.SetThreadExecutionState(flags))
+    except Exception:
+        return False
+
+
 def term_enter_raw_noecho() -> Optional[list]:
     """stdin -> noncanonical + no-echo (hotkey mode)"""
     if termios is None:
@@ -1455,6 +1503,8 @@ class KDNode:
             "env": 3,
             "script_version": SCRIPT_VERSION,
             "script_revision": SCRIPT_REVISION,
+            "script_origin": SCRIPT_ORIGIN,
+            "script_lineage": SCRIPT_LINEAGE,
             "script_hash": SCRIPT_HASH,
             "name": self.name,
             "update_transport": "mesh-chunks",
@@ -1573,7 +1623,7 @@ class KDNode:
 
         # Queue pacing state. 0 means the next earned turn may release one
         # queued envelope. Positive values mean that many earned turns must be
-        # spent as dummy cover before the next queued envelope is released.
+        # spent as dummy traffic before the next queued envelope is released.
         self.queue_emit_gap_min_turns = int(QUEUE_EMIT_GAP_MIN_TURNS)
         self.queue_emit_gap_max_turns = int(QUEUE_EMIT_GAP_MAX_TURNS)
         self.queue_emit_turns_wait = 0
@@ -1623,7 +1673,7 @@ class KDNode:
         self.chunk_completed: Dict[str, float] = {}
         # Receiver-led pull swarm state. Requests are ordinary encrypted control
         # blocks; replies are ordinary manifest/data blocks. Nothing here changes
-        # relay camouflage or bypasses the earned-turn scheduler.
+        # relay uniformity or bypasses the earned-turn scheduler.
         self.pull_last_serve: Dict[Tuple[str, str], float] = {}
         self.pull_discovery_seen: Dict[str, float] = {}
         self.pull_discovery_state = {"active": False, "attempts": 0, "last_ts": 0.0, "base_version": "", "base_revision": 0, "base_hash": ""}
@@ -1751,11 +1801,11 @@ class KDNode:
         self.load_manual_peers()
 
     def _schedule_next_queue_emit_gap(self) -> int:
-        """Pick how many future earned turns to spend as dummy cover before
+        """Pick how many future earned turns to spend as dummy traffic before
         another queued envelope may be released.
 
         If min=max=1, queued envelopes can go out on consecutive earned turns.
-        If the random draw is 7, six intervening earned turns are dummy cover
+        If the random draw is 7, six intervening earned turns are dummy traffic
         and the seventh future turn may release the next queued envelope.
         """
         lo = max(1, int(getattr(self, "queue_emit_gap_min_turns", QUEUE_EMIT_GAP_MIN_TURNS)))
@@ -1800,7 +1850,7 @@ class KDNode:
         """Scheduler weight for queued traffic classes.
 
         This is not a strict priority queue. It is a weighted draw so payload,
-        repair, receipts and dummy cover remain statistically blended rather
+        repair, receipts and dummy traffic remain statistically blended rather
         than producing an obvious file-transfer mode.
         """
         l = str(label or "").upper()
@@ -1939,20 +1989,20 @@ class KDNode:
             return None
 
     def _dummy_blend_probability(self) -> float:
-        """Chance to spend an otherwise eligible turn on dummy cover.
+        """Chance to spend an otherwise eligible turn on dummy traffic.
 
         dev16.25 repair-drain fix:
         A coalesced repair side-set is real work even when the ordinary
         outbound queue is empty.  dev16.24 accidentally returned 1.0 whenever
         q==0, which meant repair_pending>0 could sit forever because every
-        earned turn was treated as dummy cover.  Check repair_pending first so
+        earned turn was treated as dummy traffic.  Check repair_pending first so
         q=0 repair=N drains normally.
         """
         q = len(getattr(self, "outbound_queue", []) or [])
         repair_n = self._repair_pending_count()
         if repair_n > 0:
             # In pure repair mode the receiver is already waiting for exact
-            # missing chunks. Keep a little cover when mixed with ordinary
+            # missing chunks. Keep a little dummy traffic when mixed with ordinary
             # traffic, but do not starve repairs when q is empty.
             base = float(globals().get("QUEUE_DUMMY_BLEND_REPAIR", 0.04))
             return min(base, 0.02) if q <= 0 else base
@@ -2292,7 +2342,7 @@ class KDNode:
             return True
 
     def inject_height_wait_cover(self):
-        """Preserve cover traffic while rate-limiting explicit HEIGHT-WAIT notices."""
+        """Preserve dummy traffic while rate-limiting explicit HEIGHT-WAIT notices."""
         now = now_ts()
         interval = max(5.0, float(globals().get("KDK_HEIGHT_WAIT_NOTICE_SECS", 60.0)))
         last = float(getattr(self, "dingo_height_wait_last_notice_ts", 0.0) or 0.0)
@@ -2301,7 +2351,7 @@ class KDNode:
             self.dingo_height_wait_last_notice_ts = now
             self.dingo_height_wait_suppressed = 0
             if suppressed:
-                self.log_event(f"[HEIGHT-WAIT] cover turns suppressed={suppressed}")
+                self.log_event(f"[HEIGHT-WAIT] dummy turns suppressed={suppressed}")
             self.inject_dummy("HEIGHT-WAIT")
         else:
             self.dingo_height_wait_suppressed = int(getattr(self, "dingo_height_wait_suppressed", 0) or 0) + 1
@@ -2338,7 +2388,7 @@ class KDNode:
 
                 # Height synchronises eligibility, not exact transmission time.
                 # If the current Dingo epoch has already spent its substantive
-                # slot, preserve the queued item and use this Brownian turn as cover.
+                # slot, preserve the queued item and use this Brownian turn as dummy traffic.
                 if not self._height_send_allowed(label):
                     self.inject_height_wait_cover()
                     self.queue_emit_turns_wait = 0
@@ -2369,7 +2419,7 @@ class KDNode:
                 q_after = len(self.outbound_queue)
                 repair_after = self._repair_pending_count()
                 # In pure repair mode there may be no ambient collision stream
-                # to count down a random queue wait.  Keep repairs moving; cover
+                # to count down a random queue wait.  Keep repairs moving; dummy traffic
                 # is still provided by normal mesh dummy traffic and relay churn.
                 next_wait = 0 if (repair_after > 0 and q_after == 0) else (self._schedule_next_queue_emit_gap() if (q_after > 0 or repair_after > 0) else 0)
                 self.queue_emit_turns_wait = next_wait
@@ -2729,6 +2779,8 @@ class KDNode:
         peer_ver = caps.get("script_version", "?") if isinstance(caps, dict) else "?"
         peer_rev = caps.get("script_revision") if isinstance(caps, dict) else None
         peer_hash = caps.get("script_hash", "?") if isinstance(caps, dict) else "?"
+        peer_origin = caps.get("script_origin", "") if isinstance(caps, dict) else ""
+        peer_lineage = caps.get("script_lineage", "") if isinstance(caps, dict) else ""
 
         # Log first observed version/hash tuple per peer. This proves whether
         # caps are actually arriving over HELLO / DISCOVER / HEARTBEAT without
@@ -2746,6 +2798,17 @@ class KDNode:
                 f"peer_ver={peer_ver} peer_hash={peer_hash} "
                 f"local_ver={SCRIPT_VERSION} local_hash={SCRIPT_HASH} addr={addr}"
             )
+
+        if not kdk_release_identity_matches(peer_origin, peer_lineage):
+            lineage_key = (str(peer_id), str(peer_origin), str(peer_lineage))
+            if lineage_key not in getattr(self, "version_mismatch_seen", set()):
+                self.version_mismatch_seen.add(lineage_key)
+                self.log_event(
+                    f"[VERSION] different lineage peer={short8(peer_id)} "
+                    f"remote={peer_origin or '?'}:{peer_lineage or '?'} "
+                    f"local={SCRIPT_ORIGIN}:{SCRIPT_LINEAGE}; automatic update comparison suppressed"
+                )
+            return
 
         if not peer_hash or peer_hash == "?" or peer_hash == SCRIPT_HASH:
             return
@@ -2824,7 +2887,7 @@ class KDNode:
             # Dev auto-offer: when this node is newer, push its current script
             # to the older peer as a normal KDK chunked object. The receiver
             # still accepts only strictly newer versions under its own policy.
-            self.maybe_auto_offer_update(peer_id, peer_ver, peer_hash)
+            self.maybe_auto_offer_update(peer_id, peer_ver, peer_hash, peer_origin, peer_lineage)
 
     def _discover_local_ipv4s(self) -> set:
         """Best-effort set of IPv4 addresses assigned to this host."""
@@ -6998,7 +7061,7 @@ class KDNode:
         # Manifests are tiny but essential.  Send several copies, spaced through
         # the data stream, so a large file does not stall as orphan chunks if
         # the first manifest is lost in churn.  Outwardly these are ordinary
-        # encrypted payloads, so camouflage is preserved.
+        # encrypted payloads, so traffic uniformity is preserved.
         manifest_meta = self._chunk_block_telemetry([manifest])
         manifest_repeats = max(1, int(KDK_MANIFEST_REPEAT_COUNT))
 
@@ -8401,6 +8464,8 @@ class KDNode:
                 continue
             if str(caps.get("script_version", "")) != str(script_version):
                 continue
+            if not kdk_release_identity_matches(caps.get("script_origin", ""), caps.get("script_lineage", "")):
+                continue
             try:
                 if now - float(getattr(self, "active_nodes", {}).get(nid, 0.0)) > ACTIVE_TIMEOUT:
                     continue
@@ -8481,7 +8546,7 @@ class KDNode:
             self.log_event(f"[UPDATE] offer failed dst={short8(dst_id)} reason={reason} err={type(e).__name__}: {e}")
             return False
 
-    def maybe_auto_offer_update(self, peer_id: str, peer_ver: str, peer_hash: str):
+    def maybe_auto_offer_update(self, peer_id: str, peer_ver: str, peer_hash: str, peer_origin: str = "", peer_lineage: str = ""):
         """Offer our current script to an older peer once per peer/local version.
 
         This is deliberately only for strictly older peer versions. Same-version
@@ -8489,6 +8554,8 @@ class KDNode:
         """
         policy = str(getattr(self, "update_policy", "off") or "off")
         if policy not in ("force-latest", "stage"):
+            return
+        if not kdk_release_identity_matches(peer_origin, peer_lineage):
             return
         if version_cmp(SCRIPT_VERSION, str(peer_ver)) <= 0:
             return
@@ -8880,6 +8947,21 @@ class KDNode:
                 f"Patch received from {self.activity_peer_name(src_id)} "
                 f"({target_version}, {len(bytes(blob))} bytes)"
             )
+
+            target_origin = str(canonical_bundle.get("target_origin", "") or "")
+            target_lineage = str(canonical_bundle.get("target_lineage", "") or "")
+            base_origin = str(canonical_bundle.get("base_origin", "") or "")
+            base_lineage = str(canonical_bundle.get("base_lineage", "") or "")
+            if not kdk_release_identity_matches(target_origin, target_lineage):
+                raise ValueError(
+                    f"patch target lineage {target_origin or '?'}:{target_lineage or '?'} "
+                    f"does not match local {SCRIPT_ORIGIN}:{SCRIPT_LINEAGE}"
+                )
+            if not kdk_release_identity_matches(base_origin, base_lineage):
+                raise ValueError(
+                    f"patch base lineage {base_origin or '?'}:{base_lineage or '?'} "
+                    f"does not match local {SCRIPT_ORIGIN}:{SCRIPT_LINEAGE}"
+                )
 
             current_raw = open(__file__, "rb").read()
             current_hash = hashlib.sha256(current_raw).hexdigest()
@@ -9782,7 +9864,7 @@ class KDNode:
             "last_tx_ts": now_ts(),
             "tx_mode": "origin",
             # Preserve outward metadata parity with genuine originated payloads.
-            # The dummy frame remains undecryptable cover traffic, but an external
+            # The dummy frame remains undecryptable dummy traffic, but an external
             # observer can no longer classify it merely by missing sender fields.
             "sender_vk": self.verify_key.encode(),
             "sender_ek": bytes(self.box_pk),
@@ -10465,7 +10547,7 @@ class KDNode:
         # terminal only after a successful decrypt, or after decrypting an
         # envelope that is clearly not addressed to this node.
         # Every PAYLOAD sighting performs exactly one local Box decrypt attempt,
-        # including first sightings, duplicate/collision copies, and dummy cover.
+        # including first sightings, duplicate/collision copies, and dummy traffic.
         # Relays preserve the originator's sender_ek, so there is no need to scan
         # every known peer key.  decrypt_attempted suppresses duplicate *processing*
         # only; it no longer suppresses the cryptographic attempt itself.
@@ -10624,6 +10706,23 @@ class KDNode:
         last_gc = float(getattr(self, "_last_cleanup_gc_ts", 0.0) or 0.0)
         if now - last_gc >= 1.0:
             self._last_cleanup_gc_ts = now
+
+            # Enforce expiry of observer-only telemetry independently of HUD
+            # rendering/status calls. These structures must remain ephemeral.
+            window = max(
+                5.0,
+                float(getattr(
+                    self,
+                    "timelock_live_collision_window_secs",
+                    30.0,
+                ) or 30.0),
+            )
+            q = self.timelock_live_collision_times
+            cutoff = now - window
+            while q and float(q[0]) < cutoff:
+                q.popleft()
+
+            self.pulse_prune()
             dead = [nid for nid, ts in self.active_nodes.items()
                     if nid != self.node_id and (now - ts > ACTIVE_TIMEOUT)]
             for nid in dead:
@@ -12798,14 +12897,20 @@ class KDNode:
         return f"[ {colour}{name}{restore} {arrow} ]"
 
     def activity_peer_pointer_row(self, text: str, selected: bool) -> str:
-        """Use one peer-list convention: a black pointer and selected emphasis."""
+        """Render peer-list pointer and peer text as two independent elements.
+
+        The pointer always stays at normal intensity.  Only the selected peer
+        text receives bold intensity, so later movement through the list cannot
+        accidentally invert/fade the triangle along with the peer label.
+        """
+        label = str(text)
         if not selected:
-            return f"    {str(text)}"
-        # Keep the pointer outside the selected row's intensity.  Several
-        # light-pane terminals render ANSI bold as a paler black, so allowing
-        # the triangle to inherit bold makes the selection marker look faded.
+            return f"    {label}"
         foreground = "\033[30m" if bool(getattr(self, "activity_light_pane", True)) else "\033[39m"
-        return f"  \033[22m{foreground}▶ \033[1m{str(text)}\033[22m"
+        # Reset intensity before the pointer, reset again before the label, then
+        # apply bold to the label only.  Reasserting bold after the foreground
+        # escape avoids terminals that lose intensity while changing colour.
+        return f"  \033[22m{foreground}▶ \033[22m\033[1m{label}\033[22m"
 
     def render_activity_pane(self, width: int = 78, height: int = 12) -> str:
         """Simple bordered message/system pane below the fixed HUD."""
@@ -12927,7 +13032,48 @@ class KDNode:
                 row = self.activity_colour_identity_names(row, bold=False)
                 row += "\033[22m"
             else:
-                row = self.activity_colour_identity_names(row)
+                # Peer-list selection rows already carry their own pointer/text
+                # intensity.  Identity colouring changes foreground only and must
+                # not become the final operation that determines selection weight.
+                # Selected peer rows need different treatment from ordinary
+                # identity-coloured rows.  On several Windows consoles SGR 1
+                # changes a true-colour foreground to a brighter/paler colour
+                # rather than producing a visibly heavier glyph.  Keep the
+                # pointer and label independent: the pointer remains ordinary
+                # black, while the selected label uses the pane foreground plus
+                # bold.  Unselected peers retain their identity colours.
+                if "▶ " in str(row):
+                    plain = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", str(row))
+                    pointer_pos = plain.find("▶ ")
+                    label = plain[pointer_pos + 2:] if pointer_pos >= 0 else plain
+                    foreground = "\033[30m" if bool(getattr(self, "activity_light_pane", True)) else "\033[39m"
+
+                    # Match the working To: peer selector exactly: set the
+                    # identity foreground first, then enable bold.  On Windows
+                    # VT the order matters; setting true-colour *after* SGR 1
+                    # can collapse the intended emphasis into bright/grey text.
+                    selected_label = label
+                    mapping = self.activity_identity_name_map()
+                    for peer_name in sorted(mapping, key=len, reverse=True):
+                        if not peer_name:
+                            continue
+                        match = re.search(
+                            r"(?<![\w-])" + re.escape(peer_name) + r"(?![\w-])",
+                            label,
+                        )
+                        if match is None:
+                            continue
+                        start, end = match.span()
+                        r, g, b = self.identity_colour_rgb(mapping[peer_name])
+                        identity_colour = f"\033[38;2;{r};{g};{b}m"
+                        selected_label = (
+                            f"{label[:start]}{identity_colour}\033[1m{label[start:end]}"
+                            f"\033[22m{foreground}{label[end:]}"
+                        )
+                        break
+                    row = f"  \033[22m{foreground}▶ {selected_label}"
+                else:
+                    row = self.activity_colour_identity_names(row)
             colour = self.activity_colour(who, row)
             reset = self.activity_reset_colour() if colour else ""
             lines.append(self._activity_box_line(" " + row, inner, prefix_ansi=colour, suffix_ansi=reset))
@@ -13708,6 +13854,7 @@ def main(argv=None):
     # Visible, self-contained patch behaviour: centre packaged/native Windows
     # consoles. Other platforms continue unchanged.
     centre_console_window()
+    keep_awake_active = bool(getattr(args, "keep_awake", False)) and windows_keep_awake(True)
 
     peers = parse_peers(args.peer)
     used_default_profile = False
@@ -13818,6 +13965,7 @@ def main(argv=None):
         f"AIRGAP hotkey={'on' if ENABLE_AIRGAP_HOTKEY else 'off'}; "
         f"height_source={node.airgap_height_source}; "
         f"update_policy={node.update_policy}; auto_apply={node.update_auto_apply}; auto_restart={getattr(node, 'update_auto_restart', True)}; "
+        f"release={SCRIPT_ORIGIN}:{SCRIPT_LINEAGE}; keep_awake={keep_awake_active}; "
         f"bootstrap_peers={len(node.peers)}"
     )
 
@@ -13832,6 +13980,8 @@ def main(argv=None):
     try:
         node.run()
     finally:
+        if bool(getattr(args, "keep_awake", False)):
+            windows_keep_awake(False)
         kdk_clear_supervisor_ready()
 
     pending_restart = getattr(node, "_pending_update_restart", None)
@@ -13892,6 +14042,8 @@ def build_argv_from_config(config: dict) -> List[str]:
 
     if not bool(cfg.get("colour", True)):
         argv.append("--no-colour")
+    if bool(cfg.get("keep_awake", False)):
+        argv.append("--keep-awake")
 
     # Public/default update policy is manual consent.  Trusted development
     # deployments may explicitly select stage or force-latest in config.json.
